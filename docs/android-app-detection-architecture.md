@@ -123,6 +123,107 @@ flowchart LR
 - **时间准确性**：
   - 记录 `device_ts` 与 `server_received_ts`，便于时钟漂移校正。
 
+## 3.5 Agent 端可发现性设计（跨网络快速发现与数据接收）
+
+> 目标：让 Agent 在 Wi-Fi、蜂窝网络、同网段局域网、NAT/防火墙隔离等不同网络环境下，都可以被“接收端”快速发现，并尽快建立稳定数据通道。
+
+### 3.5.1 设计原则
+
+1. **多通道发现并存**：本地广播发现 + 云端目录发现 + 反向长连接发现。
+2. **先发现、后鉴权、再收数**：发现不等于可信，接收数据前必须完成身份校验。
+3. **按网络环境自适应**：自动识别网络类型，选择最低成本、最高成功率的发现路径。
+4. **秒级可达与退化可用**：理想情况下秒级发现；异常时可退化为轮询/目录模式。
+
+### 3.5.2 三层发现架构
+
+```mermaid
+flowchart TD
+    subgraph LocalNet[同网段局域网]
+      A1[mDNS/Bonjour 广播]
+      A2[UDP Beacon]
+      A3[被动监听 + 主动探测]
+    end
+
+    subgraph Cloud[跨网/异网]
+      B1[Device Registry 心跳注册]
+      B2[能力目录查询 API]
+      B3[推送在线状态变更 Webhook/SSE]
+    end
+
+    subgraph Tunnel[NAT/受限网络]
+      C1[Agent -> Relay 的 WebSocket/MQTT 长连接]
+      C2[接收端通过 Relay 反向寻址]
+    end
+
+    R[Receiver] --> A3
+    R --> B2
+    R --> C2
+```
+
+### 3.5.3 场景化策略矩阵
+
+| 网络场景 | 首选发现方式 | 备选方式 | 典型时延 |
+|---|---|---|---|
+| 同 Wi-Fi / 同子网 | mDNS 服务发现 | UDP Beacon + 端口探测 | 0.5~2s |
+| 不同子网（企业内网） | 云端 Registry 查询 | SSE 推送在线状态 | 1~5s |
+| 蜂窝网络 / CGNAT | 反向长连接（WS/MQTT） | 短轮询目录服务 | 2~8s |
+| 严格防火墙环境 | 443 端口 TLS 长连接 | 代理网关转发 | 3~10s |
+
+### 3.5.4 Agent 广播与注册协议
+
+1. **局域网广播（可选启用）**
+   - Agent 周期发布 `service=_appradar-agent._tcp.local`（mDNS TXT 含 `device_id_hash`,`ver`,`cap`）。
+   - 同时每 2~5 秒发送轻量 UDP Beacon（仅含匿名标识与能力摘要）。
+
+2. **云端注册（默认启用）**
+   - Agent 启动后向 `Device Registry` 注册并维持心跳（例如 15s/次）。
+   - 注册信息：`device_id_hash`、`network_type`、`reachable_mode(lan|relay|both)`、`last_seen`、`capabilities`。
+
+3. **反向可达（受限网络关键）**
+   - Agent 主动连 `Relay`（WSS:443），保持低频心跳。
+   - 接收端只需知道 `device_id`，即可通过 Relay 路由到在线 Agent。
+
+### 3.5.5 Receiver 快速发现流程（建议）
+
+1. **并行启动三路发现**：`LAN` 扫描、`Registry` 查询、`Relay` 在线探测。
+2. **首个命中即建立通道**：优先级 `LAN 直连 > Relay > 云中转拉取`。
+3. **短期缓存发现结果**：缓存 30~120 秒，避免重复探测。
+4. **链路健康检查**：若 RTT/丢包升高，自动切换到次优路径。
+
+### 3.5.6 统一发现数据结构（示例）
+
+```json
+{
+  "device_id": "hashed_android_id",
+  "display_name": "Pixel-01",
+  "online": true,
+  "reachable_mode": "lan|relay|both",
+  "lan_endpoint": "192.168.1.10:46001",
+  "relay_endpoint": "wss://relay.example.com/session/abc",
+  "capabilities": ["events.push", "batch.upload", "delta.sync"],
+  "network_type": "WIFI|CELL",
+  "last_seen": 1760000000123,
+  "priority": 10
+}
+```
+
+### 3.5.7 安全控制（发现链路）
+
+- 局域网广播包不放敏感信息，仅放匿名设备标识与版本能力。
+- 发现后建立连接时执行双向认证（JWT + 设备签名，企业场景可加 mTLS）。
+- 每次会话下发短时令牌（1~5 分钟）用于接收数据，过期即失效。
+- 对发现请求与连接建立执行频率限制，防止扫描与放大攻击。
+
+### 3.5.8 可观测性指标（Discovery SLI/SLO）
+
+- `discovery_success_rate`（5 分钟窗口）
+- `discovery_p95_latency_ms`
+- `first_packet_after_discovery_ms`
+- `path_switch_count`（LAN/Relay 切换次数）
+- `relay_online_ratio`
+
+建议目标：`discovery_success_rate >= 99%`，`p95_latency <= 5s`（企业网络可按区域分层定义）。
+
 ---
 
 ## 4. 服务端设计
@@ -319,4 +420,3 @@ sequenceDiagram
     W->>R: query realtime current_app
     W->>C: query historical timeline
 ```
-
